@@ -1,0 +1,855 @@
+#!/usr/bin/ksh -p
+
+AWK=gawk
+
+HTML='<?xml version="1.0"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">\n'
+
+FRAMEHTML='<?xml version="1.0"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Frameset//EN"
+    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">\n'
+
+STDHEAD='<meta http-equiv="cache-control" content="no-cache"></meta>
+<meta http-equiv="Pragma" content="no-cache"></meta>
+<meta http-equiv="Expires" content="-1"></meta>
+<!--
+   Note to customizers: the body of the webrev is IDed as SUNWwebrev
+   to allow easy overriding by users of webrev via the userContent.css
+   mechanism available in some browsers.
+
+   For example, to have all "removed" information be red instead of
+   brown, set a rule in your userContent.css file like:
+
+       body#SUNWwebrev span.removed { color: red ! important; }
+-->
+<style type="text/css" media="screen">
+body {
+    background-color: #eeeeee;
+}
+hr {
+    border: none 0;
+    border-top: 1px solid #aaa;
+    height: 1px;
+}
+div.summary {
+    font-size: .8em;
+    border-bottom: 1px solid #aaa;
+    padding-left: 1em;
+    padding-right: 1em;
+}
+div.summary h2 {
+    margin-bottom: 0.3em;
+}
+div.summary table th {
+    text-align: right;
+    vertical-align: top;
+    white-space: nowrap;
+}
+span.lineschanged {
+    font-size: 0.7em;
+}
+span.oldmarker {
+    color: red;
+    font-size: large;
+    font-weight: bold;
+}
+span.newmarker {
+    color: green;
+    font-size: large;
+    font-weight: bold;
+}
+span.removed {
+    color: red;
+}
+span.changed {
+    color: blue;
+}
+span.new {
+    color: green;
+}
+span.chmod {
+    font-size: 0.7em;
+    color: #db7800;
+}
+a.print { font-size: x-small; }
+a:hover { background-color: #ffcc99; }
+</style>
+
+<style type="text/css" media="print">
+pre { font-size: 0.8em; font-family: courier, monospace; }
+span.removed { color: #444; font-style: italic }
+span.changed { font-weight: bold; }
+span.new { font-weight: bold; }
+span.newmarker { font-size: 1.2em; font-weight: bold; }
+span.oldmarker { font-size: 1.2em; font-weight: bold; }
+a.print {display: none}
+hr { border: none 0; border-top: 1px solid #aaa; height: 1px; }
+</style>
+'
+
+#
+# input_cmd | html_quote | output_cmd
+# or
+# html_quote filename | output_cmd
+#
+# Make a piece of source code safe for display in an HTML <pre> block.
+#
+html_quote()
+{
+	sed -e "s/&/\&amp;/g" -e "s/</\&lt;/g" -e "s/>/\&gt;/g" "$@" | expand
+}
+
+#
+# strip_unchanged <infile> | output_cmd
+#
+# Removes chunks of sdiff documents that have not changed. This makes it
+# easier for a code reviewer to find the bits that have changed.
+#
+# Deleted lines of text are replaced by a horizontal rule. Some
+# identical lines are retained before and after the changed lines to
+# provide some context.  The number of these lines is controlled by the
+# variable C in the $AWK script below.
+#
+# The script detects changed lines as any line that has a "<span class="
+# string embedded (unchanged lines have no particular class and are not
+# part of a <span>).  Blank lines (without a sequence number) are also
+# detected since they flag lines that have been inserted or deleted.
+#
+strip_unchanged()
+{
+	$AWK '
+	BEGIN	{ C = c = 20 }
+	NF == 0 || /<span class="/ {
+		if (c > C) {
+			c -= C
+			inx = 0
+			if (c > C) {
+				print "\n</pre><hr></hr><pre>"
+				inx = c % C
+				c = C
+			}
+
+			for (i = 0; i < c; i++)
+				print ln[(inx + i) % C]
+		}
+		c = 0;
+		print
+		next
+	}
+	{	if (c >= C) {
+			ln[c % C] = $0
+			c++;
+			next;
+		}
+		c++;
+		print
+	}
+	END	{ if (c > (C * 2)) print "\n</pre><hr></hr>" }
+
+	' $1
+}
+
+#
+# relative_dir
+#
+# Print a relative return path from $1 to $2.  For example if
+# $1=/tmp/myreview/raw_files/usr/src/tools/scripts and $2=/tmp/myreview,
+# this function would print "../../../../".
+#
+# In the event that $1 is not in $2 a warning is printed to stderr,
+# and $2 is returned-- the result of this is that the resulting webrev
+# is not relocatable.
+#
+function relative_dir
+{
+	typeset cur="${1##$2?(/)}"
+	typeset ret=""
+	if [[ $2 == $cur ]]; then   # Should never happen.
+		# Should never happen.
+		print -u2 "\nWARNING: relative_dir: \"$1\" not relative "
+		print -u2 "to \"$2\".  Check input paths.  Framed webrev "
+		print -u2 "will not be relocatable!"
+		print $2
+		return
+	fi
+
+	while [[ -n ${cur} ]];
+	do
+		cur=${cur%%*(/)*([!/])}
+		if [[ -z $ret ]]; then
+			ret=".."
+		else
+			ret="../$ret"
+		fi
+	done
+	print $ret
+}
+
+#
+# input_cmd | insert_anchors | output_cmd
+#
+# Flag blocks of difference with sequentially numbered invisible
+# anchors.  These are used to drive the frames version of the
+# sdiffs output.
+#
+# NOTE: Anchor zero flags the top of the file irrespective of changes,
+# an additional anchor is also appended to flag the bottom.
+#
+# The script detects changed lines as any line that has a "<span
+# class=" string embedded (unchanged lines have no class set and are
+# not part of a <span>.  Blank lines (without a sequence number)
+# are also detected since they flag lines that have been inserted or
+# deleted.
+#
+function insert_anchors
+{
+	$AWK '
+	function ia() {
+		printf "<a name=\"%d\" id=\"anc%d\"></a>", anc, anc++;
+	}
+
+	BEGIN {
+		anc=1;
+		inblock=1;
+		printf "<pre>\n";
+	}
+	NF == 0 || /^<span class=/ {
+		if (inblock == 0) {
+			ia();
+			inblock=1;
+		}
+		print;
+		next;
+	}
+	{
+		inblock=0;
+		print;
+	}
+	END {
+		ia();
+
+		printf "<b style=\"font-size: large; color: red\">";
+		printf "--- EOF ---</b>"
+        	for(i=0;i<8;i++) printf "\n\n\n\n\n\n\n\n\n\n";
+		printf "</pre>"
+		printf "<form name=\"eof\">";
+		printf "<input name=\"value\" value=\"%d\" " \
+		    "type=\"hidden\"></input>", anc - 1;
+		printf "</form>";
+	}
+	' $1
+}
+
+#
+# framed_sdiff <filename> <filepath> <lhsfile> <rhsfile> <comment>
+#
+# Expects lefthand and righthand side html files created by sdiff_to_html.
+# We use insert_anchors() to augment those with HTML navigation anchors,
+# and then emit the main frame.  Content is placed into:
+#
+#    $WDIR/DIR/$TNAME.lhs.html
+#    $WDIR/DIR/$TNAME.rhs.html
+#    $WDIR/DIR/$TNAME.frames.html
+#
+# NOTE: We rely on standard usage of $WDIR and $DIR.
+#
+function framed_sdiff
+{
+	typeset TNAME=$1
+	typeset TPATH=$2
+	typeset lhsfile=$3
+	typeset rhsfile=$4
+	typeset comments=$5
+	typeset RTOP
+
+	# Enable html files to access WDIR via a relative path.
+	RTOP=$(relative_dir $TPATH $WDIR)
+
+	# Make the rhs/lhs files and output the frameset file.
+	print "$HTML<head>$STDHEAD" > $WDIR/$DIR/$TNAME.lhs.html
+
+	cat >> $WDIR/$DIR/$TNAME.lhs.html <<-EOF
+	    <script type="text/javascript" src="$RTOP/ancnav.js"></script>
+	    </head>
+	    <body id="SUNWwebrev" onkeypress="keypress(event);">
+	    <a name="0"></a>
+	    <pre>$comments</pre><hr></hr>
+	EOF
+
+	cp $WDIR/$DIR/$TNAME.lhs.html $WDIR/$DIR/$TNAME.rhs.html
+
+	insert_anchors $lhsfile >> $WDIR/$DIR/$TNAME.lhs.html
+	insert_anchors $rhsfile >> $WDIR/$DIR/$TNAME.rhs.html
+
+	close='</body></html>'
+
+	print $close >> $WDIR/$DIR/$TNAME.lhs.html
+	print $close >> $WDIR/$DIR/$TNAME.rhs.html
+
+	print "$FRAMEHTML<head>$STDHEAD" > $WDIR/$DIR/$TNAME.frames.html
+	print "<title> Framed-Sdiff " \
+	    "$TPATH/$TNAME</title> </head>" >> $WDIR/$DIR/$TNAME.frames.html
+	cat >> $WDIR/$DIR/$TNAME.frames.html <<-EOF
+	  <frameset rows="*,60">
+	    <frameset cols="50%,50%">
+	      <frame src="$TNAME.lhs.html" scrolling="auto" name="lhs"></frame>
+	      <frame src="$TNAME.rhs.html" scrolling="auto" name="rhs"></frame>
+	    </frameset>
+	  <frame src="$RTOP/ancnav.html" scrolling="no" marginwidth="0"
+	   marginheight="0" name="nav"></frame>
+	  <noframes>
+            <body id="SUNWwebrev">
+	      Alas 'frames' webrev requires that your browser supports frames
+	      and has the feature enabled.
+            </body>
+	  </noframes>
+	  </frameset>
+	</html>
+	EOF
+}
+
+#
+# frame_nav_js
+#
+# Emit javascript for frame navigation
+#
+function frame_nav_js
+{
+cat << \EOF
+var myInt;
+var scrolling=0;
+var sfactor = 3;
+var scount=10;
+
+function scrollByPix() {
+	if (scount<=0) {
+		sfactor*=1.2;
+		scount=10;
+	}
+	parent.lhs.scrollBy(0,sfactor);
+	parent.rhs.scrollBy(0,sfactor);
+	scount--;
+}
+
+function scrollToAnc(num) {
+
+	// Update the value of the anchor in the form which we use as
+	// storage for this value.  setAncValue() will take care of
+	// correcting for overflow and underflow of the value and return
+	// us the new value.
+	num = setAncValue(num);
+
+	// Set location and scroll back a little to expose previous
+	// lines.
+	//
+	// Note that this could be improved: it is possible although
+	// complex to compute the x and y position of an anchor, and to
+	// scroll to that location directly.
+	//
+	parent.lhs.location.replace(parent.lhs.location.pathname + "#" + num);
+	parent.rhs.location.replace(parent.rhs.location.pathname + "#" + num);
+
+	parent.lhs.scrollBy(0,-30);
+	parent.rhs.scrollBy(0,-30);
+}
+
+function getAncValue()
+{
+	return (parseInt(parent.nav.document.diff.real.value));
+}
+
+function setAncValue(val)
+{
+	if (val <= 0) {
+		val = 0;
+		parent.nav.document.diff.real.value = val;
+		parent.nav.document.diff.display.value = "BOF";
+		return (val);
+	}
+
+	//
+	// The way we compute the max anchor value is to stash it
+	// inline in the left and right hand side pages-- it's the same
+	// on each side, so we pluck from the left.
+	//
+	maxval = parent.lhs.document.eof.value.value;
+	if (val < maxval) {
+		parent.nav.document.diff.real.value = val;
+		parent.nav.document.diff.display.value = val.toString();
+		return (val);
+	}
+
+	// this must be: val >= maxval
+	val = maxval;
+	parent.nav.document.diff.real.value = val;
+	parent.nav.document.diff.display.value = "EOF";
+	return (val);
+}
+
+function stopScroll() {
+	if (scrolling==1) {
+		clearInterval(myInt);
+		scrolling=0;
+	}
+}
+
+function startScroll() {
+	stopScroll();
+	scrolling=1;
+	myInt=setInterval("scrollByPix()",10);
+}
+
+function handlePress(b) {
+
+	switch (b) {
+	    case 1 :
+		scrollToAnc(-1);
+		break;
+	    case 2 :
+		scrollToAnc(getAncValue() - 1);
+		break;
+	    case 3 :
+		sfactor=-3;
+		startScroll();
+		break;
+	    case 4 :
+		sfactor=3;
+		startScroll();
+		break;
+	    case 5 :
+		scrollToAnc(getAncValue() + 1);
+		break;
+	    case 6 :
+		scrollToAnc(999999);
+		break;
+	}
+}
+
+function handleRelease(b) {
+	stopScroll();
+}
+
+function keypress(ev) {
+	var keynum;
+	var keychar;
+
+	if (window.event) { // IE
+		keynum = ev.keyCode;
+	} else if (ev.which) { // non-IE
+		keynum = ev.which;
+	}
+
+	keychar = String.fromCharCode(keynum);
+
+	if (keychar == "k") {
+		handlePress(2);
+		return (0);
+	} else if (keychar == "j" || keychar == " ") {
+		handlePress(5);
+		return (0);
+	}
+	return (1);
+}
+
+function ValidateDiffNum(){
+	val = parent.nav.document.diff.display.value;
+	if (val == "EOF") {
+		scrollToAnc(999999);
+		return;
+	}
+
+	if (val == "BOF") {
+		scrollToAnc(0);
+		return;
+	}
+
+        i=parseInt(val);
+        if (isNaN(i)) {
+                parent.nav.document.diff.display.value = getAncValue();
+        } else {
+                scrollToAnc(i);
+        }
+        return false;
+}
+
+EOF
+}
+
+#
+# frame_navigation
+#
+# Output anchor navigation file for framed sdiffs.
+#
+function frame_navigation
+{
+	print "$HTML<head>$STDHEAD"
+
+	cat << \EOF
+<title>Anchor Navigation</title>
+<meta http-equiv="Content-Script-Type" content="text/javascript">
+<meta http-equiv="Content-Type" content="text/html">
+
+<style type="text/css">
+    div.button td { padding-left: 5px; padding-right: 5px;
+		    background-color: #eee; text-align: center;
+		    border: 1px #444 outset; cursor: pointer; }
+    div.button a { font-weight: bold; color: black }
+    div.button td:hover { background: #ffcc99; }
+</style>
+EOF
+
+	print "<script type=\"text/javascript\" src=\"ancnav.js\"></script>"
+
+	cat << \EOF
+</head>
+<body id="SUNWwebrev" bgcolor="#eeeeee" onload="document.diff.real.focus();"
+	onkeypress="keypress(event);">
+    <noscript lang="javascript">
+      <center>
+	<p><big>Framed Navigation controls require Javascript</big><br></br>
+	Either this browser is incompatable or javascript is not enabled</p>
+      </center>
+    </noscript>
+    <table width="100%" border="0" align="center">
+	<tr>
+          <td valign="middle" width="25%">Diff navigation:
+          Use 'j' and 'k' for next and previous diffs; or use buttons
+          at right</td>
+	  <td align="center" valign="top" width="50%">
+	    <div class="button">
+	      <table border="0" align="center">
+                  <tr>
+		    <td>
+		      <a onMouseDown="handlePress(1);return true;"
+			 onMouseUp="handleRelease(1);return true;"
+			 onMouseOut="handleRelease(1);return true;"
+			 onClick="return false;"
+			 title="Go to Beginning Of file">BOF</a></td>
+		    <td>
+		      <a onMouseDown="handlePress(3);return true;"
+			 onMouseUp="handleRelease(3);return true;"
+			 onMouseOut="handleRelease(3);return true;"
+			 title="Scroll Up: Press and Hold to accelerate"
+			 onClick="return false;">Scroll Up</a></td>
+		    <td>
+		      <a onMouseDown="handlePress(2);return true;"
+			 onMouseUp="handleRelease(2);return true;"
+			 onMouseOut="handleRelease(2);return true;"
+			 title="Go to previous Diff"
+			 onClick="return false;">Prev Diff</a>
+		    </td></tr>
+
+		  <tr>
+		    <td>
+		      <a onMouseDown="handlePress(6);return true;"
+			 onMouseUp="handleRelease(6);return true;"
+			 onMouseOut="handleRelease(6);return true;"
+			 onClick="return false;"
+			 title="Go to End Of File">EOF</a></td>
+		    <td>
+		      <a onMouseDown="handlePress(4);return true;"
+			 onMouseUp="handleRelease(4);return true;"
+			 onMouseOut="handleRelease(4);return true;"
+			 title="Scroll Down: Press and Hold to accelerate"
+			 onClick="return false;">Scroll Down</a></td>
+		    <td>
+		      <a onMouseDown="handlePress(5);return true;"
+			 onMouseUp="handleRelease(5);return true;"
+			 onMouseOut="handleRelease(5);return true;"
+			 title="Go to next Diff"
+			 onClick="return false;">Next Diff</a></td>
+		  </tr>
+              </table>
+	    </div>
+	  </td>
+	  <th valign="middle" width="25%">
+	    <form action="" name="diff" onsubmit="return ValidateDiffNum();">
+		<input name="display" value="BOF" size="8" type="text"></input>
+		<input name="real" value="0" size="8" type="hidden"></input>
+	    </form>
+	  </th>
+	</tr>
+    </table>
+  </body>
+</html>
+EOF
+}
+
+#
+# sdiff_to_html
+#
+# This function takes two files as arguments, obtains their diff, and
+# processes the diff output to present the files as an HTML document with
+# the files displayed side-by-side, differences shown in color.  It also
+# takes a delta comment, rendered as an HTML snippet, as the third
+# argument.  The function takes two files as arguments, then the name of
+# file, the path, and the comment.  The HTML will be delivered on stdout,
+# e.g.
+#
+#   $ sdiff_to_html old/usr/src/tools/scripts/webrev.sh \
+#         new/usr/src/tools/scripts/webrev.sh \
+#         webrev.sh usr/src/tools/scripts \
+#         '<a href="http://monaco.sfbay.sun.com/detail.jsp?cr=1234567">
+#          1234567</a> my bugid' > <file>.html
+#
+# framed_sdiff() is then called which creates $2.frames.html
+# in the webrev tree.
+#
+# FYI: This function is rather unusual in its use of awk.  The initial
+# diff run produces conventional diff output showing changed lines mixed
+# with editing codes.  The changed lines are ignored - we're interested in
+# the editing codes, e.g.
+#
+#      8c8
+#      57a61
+#      63c66,76
+#      68,93d80
+#      106d90
+#      108,110d91
+#
+#  These editing codes are parsed by the awk script and used to generate
+#  another awk script that generates HTML, e.g the above lines would turn
+#  into something like this:
+#
+#      BEGIN { printf "<pre>\n" }
+#      function sp(n) {for (i=0;i<n;i++)printf "\n"}
+#      function wl(n) {printf "<font color=%s>%4d %s </font>\n", n, NR, $0}
+#      NR==8           {wl("#7A7ADD");next}
+#      NR==54          {wl("#7A7ADD");sp(3);next}
+#      NR==56          {wl("#7A7ADD");next}
+#      NR==57          {wl("black");printf "\n"; next}
+#        :               :
+#
+#  This script is then run on the original source file to generate the
+#  HTML that corresponds to the source file.
+#
+#  The two HTML files are then combined into a single piece of HTML that
+#  uses an HTML table construct to present the files side by side.  You'll
+#  notice that the changes are color-coded:
+#
+#   black     - unchanged lines
+#   blue      - changed lines
+#   bold blue - new lines
+#   brown     - deleted lines
+#
+#  Blank lines are inserted in each file to keep unchanged lines in sync
+#  (side-by-side).  This format is familiar to users of sdiff(1) or
+#  Teamware's filemerge tool.
+#
+sdiff_to_html()
+{
+	diff -b $1 $2 > /tmp/$$.diffs
+
+	TNAME=$3
+	TPATH=$4
+	COMMENT=$5
+
+	#
+	#  Now we have the diffs, generate the HTML for the old file.
+	#
+	$AWK '
+	BEGIN	{
+		printf "function sp(n) {for (i=0;i<n;i++)printf \"\\n\"}\n"
+		printf "function removed() "
+		printf "{printf \"<span class=\\\"removed\\\">%%4d %%s</span>\\n\", NR, $0}\n"
+		printf "function changed() "
+		printf "{printf \"<span class=\\\"changed\\\">%%4d %%s</span>\\n\", NR, $0}\n"
+		printf "function bl() {printf \"%%4d %%s\\n\", NR, $0}\n"
+}
+	/^</	{next}
+	/^>/	{next}
+	/^---/	{next}
+
+	{
+	split($1, a, /[cad]/) ;
+	if (index($1, "a")) {
+		if (a[1] == 0) {
+			n = split(a[2], r, /,/);
+			if (n == 1)
+				printf "BEGIN\t\t{sp(1)}\n"
+			else
+				printf "BEGIN\t\t{sp(%d)}\n",\
+				(r[2] - r[1]) + 1
+			next
+		}
+
+		printf "NR==%s\t\t{", a[1]
+		n = split(a[2], r, /,/);
+		s = r[1];
+		if (n == 1)
+			printf "bl();printf \"\\n\"; next}\n"
+		else {
+			n = r[2] - r[1]
+			printf "bl();sp(%d);next}\n",\
+			(r[2] - r[1]) + 1
+		}
+		next
+	}
+	if (index($1, "d")) {
+		n = split(a[1], r, /,/);
+		n1 = r[1]
+		n2 = r[2]
+		if (n == 1)
+			printf "NR==%s\t\t{removed(); next}\n" , n1
+		else
+			printf "NR==%s,NR==%s\t{removed(); next}\n" , n1, n2
+		next
+	}
+	if (index($1, "c")) {
+		n = split(a[1], r, /,/);
+		n1 = r[1]
+		n2 = r[2]
+		final = n2
+		d1 = 0
+		if (n == 1)
+			printf "NR==%s\t\t{changed();" , n1
+		else {
+			d1 = n2 - n1
+			printf "NR==%s,NR==%s\t{changed();" , n1, n2
+		}
+		m = split(a[2], r, /,/);
+		n1 = r[1]
+		n2 = r[2]
+		if (m > 1) {
+			d2  = n2 - n1
+			if (d2 > d1) {
+				if (n > 1) printf "if (NR==%d)", final
+				printf "sp(%d);", d2 - d1
+			}
+		}
+		printf "next}\n" ;
+
+		next
+	}
+	}
+
+	END	{ printf "{printf \"%%4d %%s\\n\", NR, $0 }\n" }
+	' /tmp/$$.diffs > /tmp/$$.file1
+
+	#
+	#  Now generate the HTML for the new file
+	#
+	$AWK '
+	BEGIN	{
+		printf "function sp(n) {for (i=0;i<n;i++)printf \"\\n\"}\n"
+		printf "function new() "
+		printf "{printf \"<span class=\\\"new\\\">%%4d %%s</span>\\n\", NR, $0}\n"
+		printf "function changed() "
+		printf "{printf \"<span class=\\\"changed\\\">%%4d %%s</span>\\n\", NR, $0}\n"
+		printf "function bl() {printf \"%%4d %%s\\n\", NR, $0}\n"
+	}
+
+	/^</	{next}
+	/^>/	{next}
+	/^---/	{next}
+
+	{
+	split($1, a, /[cad]/) ;
+	if (index($1, "d")) {
+		if (a[2] == 0) {
+			n = split(a[1], r, /,/);
+			if (n == 1)
+				printf "BEGIN\t\t{sp(1)}\n"
+			else
+				printf "BEGIN\t\t{sp(%d)}\n",\
+				(r[2] - r[1]) + 1
+			next
+		}
+
+		printf "NR==%s\t\t{", a[2]
+		n = split(a[1], r, /,/);
+		s = r[1];
+		if (n == 1)
+			printf "bl();printf \"\\n\"; next}\n"
+		else {
+			n = r[2] - r[1]
+			printf "bl();sp(%d);next}\n",\
+			(r[2] - r[1]) + 1
+		}
+		next
+	}
+	if (index($1, "a")) {
+		n = split(a[2], r, /,/);
+		n1 = r[1]
+		n2 = r[2]
+		if (n == 1)
+			printf "NR==%s\t\t{new() ; next}\n" , n1
+		else
+			printf "NR==%s,NR==%s\t{new() ; next}\n" , n1, n2
+		next
+	}
+	if (index($1, "c")) {
+		n = split(a[2], r, /,/);
+		n1 = r[1]
+		n2 = r[2]
+		final = n2
+		d2 = 0;
+		if (n == 1) {
+			final = n1
+			printf "NR==%s\t\t{changed();" , n1
+		} else {
+			d2 = n2 - n1
+			printf "NR==%s,NR==%s\t{changed();" , n1, n2
+		}
+		m = split(a[1], r, /,/);
+		n1 = r[1]
+		n2 = r[2]
+		if (m > 1) {
+			d1  = n2 - n1
+			if (d1 > d2) {
+				if (n > 1) printf "if (NR==%d)", final
+				printf "sp(%d);", d1 - d2
+			}
+		}
+		printf "next}\n" ;
+		next
+	}
+	}
+	END	{ printf "{printf \"%%4d %%s\\n\", NR, $0 }\n" }
+	' /tmp/$$.diffs > /tmp/$$.file2
+
+	#
+	# Post-process the HTML files by running them back through $AWK
+	#
+	html_quote < $1 | $AWK -f /tmp/$$.file1 > /tmp/$$.file1.html
+
+	html_quote < $2 | $AWK -f /tmp/$$.file2 > /tmp/$$.file2.html
+
+	#
+	# Now combine into a valid HTML file and side-by-side into a table
+	#
+	print "$HTML<head>$STDHEAD"
+	print "<title>Sdiff $TPATH/$TNAME</title>"
+	print "</head><body id=\"SUNWwebrev\">"
+        print "<a class=\"print\" href=\"javascript:print()\">Print this page</a>"
+	print "<pre>$COMMENT</pre>\n"
+	print "<table><tr valign=\"top\">"
+	print "<td><pre>"
+
+	strip_unchanged /tmp/$$.file1.html
+
+	print "</pre></td><td><pre>"
+
+	strip_unchanged /tmp/$$.file2.html
+
+	print "</pre></td>"
+	print "</tr></table>"
+	print "</body></html>"
+
+	framed_sdiff $TNAME $TPATH /tmp/$$.file1.html /tmp/$$.file2.html "$COMMENT"
+}
+
+# Usage:       $1       $2       $3       $4     $5      $6
+# frames.sh old.file new.file filename filedir webdir comments
+
+COMT=$6
+WDIR=$5
+DIR=$4
+
+frame_nav_js > $WDIR/ancnav.js
+frame_navigation > $WDIR/ancnav.html
+
+sdiff_to_html $1 $2 $3 $DIR $COMT
