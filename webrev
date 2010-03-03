@@ -973,6 +973,10 @@ sub main ($) {
 	    }
 	    print INDEX "</FONT><BR>\n";
 	} elsif ($scm eq 'git') {
+	    print INDEX "<BR>&nbsp; &nbsp; &nbsp; &nbsp;";
+	    print INDEX "<FONT COLOR=red>";
+	    print INDEX "Submit: " . `git log --oneline -1 $file 2>&1`;
+	    print INDEX "</FONT><BR>\n";
 	} else {
 	    if (defined ($changelog_entry{$file})) {
 		print INDEX "<PRE>\n";
@@ -1080,6 +1084,7 @@ if (-f "$wdir/index.html") {
     if ($ans eq 'y' or $ans eq 'yes') {
 	system ("rm -rf $wdir");
 	$overwrite = O_CREAT;
+	print "\n";
     }
 }
 
