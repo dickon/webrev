@@ -1000,7 +1000,7 @@ sub usage {
     print "  webrev -w WEBREV_DIR [ -p PARENT ] [ -r REVISION ] [SOURCES...]\n\n";
     print "  This tool generate the web pages for code-review. It works for svn, cvs, git, perforce. It detects what's the source control management in the current directory and generate the corresponding diff web pages.\n\n";
     print "  -w WEBREV_DIR : Store the webrev to WEBREV_DIR\n";
-    print "  -p PARENT     : Generate the webrev againt the parent branch\n";
+    print "  -p PARENT     : Generate the webrev againt the parent repository branch\n";
     print "                  By default, it's the remote tracking branch\n";
     print "                  (work for git only now)\n";
     print "  -r REVISION   : Generate the webrev against the assigned REVISION.\n";
@@ -1047,8 +1047,16 @@ if (-d '.svn') {
     if ($parent eq "") {
 	my $branch = `cut -f3 -d/ .git/HEAD`;
 	chomp ($branch);
-	$parent = `sed -n '/branch "$branch"/{n;s/^.*= //p;n;s/^.*heads//p}' .git/config`;
-	$parent =~ tr/\r\n//d;
+	my $remote = `sed -n '/branch "$branch"/{n;s/^.*= //p}' .git/config`;
+	my $merge = `sed -n '/branch "$branch"/{n;n;s/^.*= //p}' .git/config`;
+	chomp ($remote);
+	chomp ($merge);
+	$merge =~ s/.*\///;
+	if ($remote eq "" || $merge eq "") {
+    		print STDERR "ERROR: default parent not found! Please assign one!\n";
+		exit (1);
+	}
+	$parent = $remote . "/" . $merge;
     }
 } else {
     system("p4 where > /dev/null 2>&1");
