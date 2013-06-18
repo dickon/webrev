@@ -113,6 +113,8 @@ my $scm="";
 my $parent="";
 # global revision of sources
 my $grev="";
+# git spec of revision
+my $gitspec="";
 # sources to create webrev
 my @srcs;
 
@@ -193,9 +195,8 @@ sub get_changed_files () {
 	    }
 	}
     } elsif ($scm eq "git") {
-	my @lines = `LC_ALL=C git diff --name-status $parent`
-	    or msg_fatal ('"cvs status" failed');
-
+	my @lines = `LC_ALL=C git diff --name-status $gitspec`
+	    or msg_fatal ("\"git diff\" $gitspec failed");
 	foreach my $line (@lines) {
 	    chomp ($line);
 	    if ($line =~ /(.)\s*(.*)/) {
@@ -347,9 +348,17 @@ sub gen_diff_new ($$) {
     my $webrev_dir = shift;
     my $file = shift;
     my $basename = basename ($file);
-    system ("rm -f $webrev_dir/$file/new.$basename; cp $file $webrev_dir/$file/new.$basename");
-    if ($? != 0) {
-	msg_fatal ("failed to copy file $file to $webrev_dir/$file");
+
+    if ($scm eq 'git' && $grev ne '') {
+	system ("git show $grev:$file > $webrev_dir/$file/new.$basename");
+	if ($? != 0) {
+	    return undef;
+	}
+    } else {
+	system ("rm -f $webrev_dir/$file/new.$basename; cp $file $webrev_dir/$file/new.$basename");
+	if ($? != 0) {
+	    msg_fatal ("failed to copy file $file to $webrev_dir/$file");
+	}
     }
 
     system ("code2html -n $webrev_dir/$file/new.$basename > $webrev_dir/$file/new.$basename.html 2>/dev/null");
@@ -436,7 +445,7 @@ sub gen_diff_udiff ($$) {
     if ($scm eq 'svn') {
 	@diff = `svn --non-interactive diff $file`;
     } elsif ($scm eq 'git') {
-	@diff = `git diff $parent -- $file`;
+	@diff = `git diff $gitspec -- $file`;
     } elsif ($scm eq 'cvs') {
 	@diff = `cd $webrev_dir/$file; /usr/bin/diff -du old.$basename new.$basename`;
     } elsif ($scm eq 'p4') {
@@ -764,7 +773,7 @@ sub gen_diff_patch ($$) {
     if ($scm eq 'svn') {
 	system ("svn --non-interactive diff $file > $webrev_dir/$file/$basename.patch");
     } elsif ($scm eq 'git') {
-	system ("git diff $parent -- $file > $webrev_dir/$file/$basename.patch");
+	system ("git diff $gitspec -- $file > $webrev_dir/$file/$basename.patch");
     } elsif ($scm eq 'cvs') {
 	system ("cvs -q diff -up $file > $webrev_dir/$file/$basename.patch");
     } elsif ($scm eq 'p4') {
@@ -805,7 +814,7 @@ sub read_changelog_entries () {
 	    if ($scm eq 'svn') {
 		@chlog_lines = `svn --non-interactive diff $file | grep "^\+"`;
 	    } elsif ($scm eq 'git') {
-		@chlog_lines = `git log --oneline $file | head -1`;
+		@chlog_lines = `git log $gitspec --oneline $file | head -1`;
 	    } elsif ($scm eq 'cvs') {
 		@chlog_lines = `cvs -q diff -u $file | grep "^\+"`;
 	    } elsif ($scm eq 'p4') {
@@ -975,7 +984,7 @@ sub main ($) {
 	} elsif ($scm eq 'git') {
 	    print INDEX "<BR>&nbsp; &nbsp; &nbsp; &nbsp;";
 	    print INDEX "<FONT COLOR=red>";
-	    print INDEX "Submit: " . `git log --oneline -1 $file 2>&1`;
+	    print INDEX "Submit: " . `git log  --oneline -1 $gitspec $file 2>&1`;
 	    print INDEX "</FONT><BR>\n";
 	} else {
 	    if (defined ($changelog_entry{$file})) {
@@ -1009,7 +1018,7 @@ sub usage {
     print "                  (work for git only now)\n";
     print "  -r REVISION   : Generate the webrev against the assigned REVISION.\n";
     print "                  By default, it's the latest.\n";
-    print "                  (work for perforce only now)\n";
+    print "                  (works for perforce and git)\n";
     print "  SOURCES       : Generate the webrev for the assigned sources.\n";
     print "                  By default, it's the current directory.\n";
     print "                  (work for perforce only now)\n";
@@ -1035,6 +1044,13 @@ while (@ARGV > 0) {
 		@srcs = ($opt, @ARGV);
 		last;
 	}
+}
+
+if ($grev eq "") {
+    $gitspec = "";
+} else {
+    $gitspec = "$grev^1..$grev";
+    $parent = "$grev^1";
 }
 
 if ($wdir eq "") {
